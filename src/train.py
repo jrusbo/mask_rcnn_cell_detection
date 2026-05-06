@@ -32,7 +32,7 @@ MIN_IMAGE_SIZE = 100  # Mask R-CNN internal resize min
 MAX_IMAGE_SIZE = 3000  # Mask R-CNN internal resize max
 
 BATCH_SIZE = 4
-NUM_WORKERS = 4
+NUM_WORKERS = 2
 
 NUM_EPOCHS = 60
 LEARNING_RATE = 1e-4
