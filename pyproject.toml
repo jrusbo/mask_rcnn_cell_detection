@@ -1,0 +1,29 @@
+[project]
+name = "mask-rcnn-cell-detection"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "torch==2.11.0+cu130",
+    "torchvision==0.26.0+cu130",
+    "torchaudio==2.11.0+cu130",
+    "torchmetrics==1.9.0",
+    "pycocotools==2.0.11",
+    "opencv-python==4.13.0.92",
+    "numpy==2.4.4",
+    "scikit-image==0.26.0",
+    "imagecodecs==2026.3.6",
+    "albumentations==2.0.8",
+    "tqdm==4.67.3",
+    "wandb>=0.26.1",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
