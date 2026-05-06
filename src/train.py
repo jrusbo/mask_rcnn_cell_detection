@@ -6,6 +6,7 @@ import wandb
 import numpy as np
 import albumentations as A
 import torch.nn.functional as F
+import torch.nn as nn
 import torchvision.models.detection.roi_heads as roi_heads
 from datetime import datetime
 from pycocotools.coco import COCO
@@ -29,10 +30,10 @@ NUM_CLASSES = 5  # 4 cells + 1 background
 FOCAL_ALPHA = 0.25  # Imbalance balancing factor for minority classes
 FOCAL_GAMMA = 2.0  # Focusing parameter for hard examples
 MIN_IMAGE_SIZE = 100  # Mask R-CNN internal resize min
-MAX_IMAGE_SIZE = 3000  # Mask R-CNN internal resize max
+MAX_IMAGE_SIZE = 800  # Mask R-CNN internal resize max
 
-BATCH_SIZE = 1
-NUM_WORKERS = 2
+BATCH_SIZE = 12
+NUM_WORKERS = 6
 
 NUM_EPOCHS = 60
 LEARNING_RATE = 1e-4
@@ -179,7 +180,13 @@ def train_and_evaluate(resume_path=None):
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS,
                             collate_fn=collate_fn, pin_memory=True, persistent_workers=use_persistent)
 
-    model = build_dcnv2_mask_rcnn().to(device)
+    model = build_dcnv2_mask_rcnn()
+
+    if torch.cuda.device_count() > 1:
+        print(f"Detected {torch.cuda.device_count()} GPUs for training")
+        model = nn.DataParallel(model)
+
+    model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=LR_STEP_SIZE, gamma=LR_GAMMA)
 
@@ -294,9 +301,11 @@ def train_and_evaluate(resume_path=None):
         wandb.log(log_metrics, step=epoch + 1)
 
         # -- CHECKPOINTING --
+        model_to_save = model.module if hasattr(model, 'module') else model
+
         torch.save({
             'epoch': epoch,
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': model_to_save.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'lr_scheduler_state_dict': lr_scheduler.state_dict(),
             'ap50': current_ap50
@@ -305,7 +314,7 @@ def train_and_evaluate(resume_path=None):
         if current_ap50 > best_ap50:
             best_ap50 = current_ap50
             best_model_path = os.path.join(run_ckpt_dir, "best_ap50_model.pth")
-            torch.save(model.state_dict(), best_model_path)
+            torch.save(model_to_save.state_dict(), best_model_path)
             print(f">>> New Best Model Saved to {best_model_path} <<<")
 
             wandb.save(best_model_path, base_path=run_ckpt_dir)

@@ -12,7 +12,7 @@ from tiling_utils import get_tile_coords_for_full_image
 
 RAW_DATA_DIR = "/kaggle/input/datasets/quinonycu/hw3-maskrcnn/train" # "datasets/train"
 OUT_DIR = "datasets/coco_format"
-USE_TILING = False  # Set to False to support full image without tiling
+USE_TILING = True  # Set to False to support full image without tiling
 PATCH_SIZE = 512
 OVERLAP = 0.25  # 25% overlap between adjacent tiles
 THRESHOLD = 0
