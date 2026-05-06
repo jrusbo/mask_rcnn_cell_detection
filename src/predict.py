@@ -36,7 +36,9 @@ def generate_submission(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Loading model from {args.model} on {device}...")
 
-    model = build_dcnv2_mask_rcnn()
+    # Set min_size=1 and max_size=3000 to prevent resizing/upscaling
+    # This allows processing full images at their native resolution.
+    model = build_dcnv2_mask_rcnn(min_size=1, max_size=3000)
 
     if not os.path.exists(args.model):
         raise FileNotFoundError(f"Checkpoint not found at: {args.model}")
@@ -44,9 +46,19 @@ def generate_submission(args):
     checkpoint = torch.load(args.model, map_location=device, weights_only=False)
 
     if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
+        model_state = checkpoint['model_state_dict']
     else:
-        model.load_state_dict(checkpoint)
+        model_state = checkpoint
+
+    # Handle DDP saved state dict if necessary
+    new_state_dict = {}
+    for k, v in model_state.items():
+        if k.startswith('module.'):
+            new_state_dict[k[7:]] = v
+        else:
+            new_state_dict[k] = v
+    
+    model.load_state_dict(new_state_dict)
 
     model.to(device)
     model.eval()
@@ -73,6 +85,10 @@ def generate_submission(args):
 
             if len(img.shape) == 3 and img.shape[2] == 4:
                 img = img[:, :, :3]
+            
+            # Handle grayscale
+            if len(img.shape) == 2:
+                img = np.stack([img, img, img], axis=2)
 
             img_tensor = torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0
             img_tensor = img_tensor.to(device)

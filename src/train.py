@@ -6,14 +6,17 @@ import wandb
 import numpy as np
 import albumentations as A
 import torch.nn.functional as F
-import torch.nn as nn
 import torchvision.models.detection.roi_heads as roi_heads
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from datetime import datetime
 from pycocotools.coco import COCO
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 from albumentations.pytorch import ToTensorV2
 from tqdm.auto import tqdm
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.cuda.amp import GradScaler, autocast
 
 from model import build_dcnv2_mask_rcnn
 
@@ -27,36 +30,37 @@ VAL_ANN_FILE = "datasets/coco_format/val.json"
 CHECKPOINT_DIR = "checkpoints"
 
 NUM_CLASSES = 5  # 4 cells + 1 background
-FOCAL_ALPHA = 0.1 # 0.25  # Imbalance balancing factor for minority classes
-FOCAL_GAMMA = 2.0  # Focusing parameter for hard examples
-MIN_IMAGE_SIZE = 100  # Mask R-CNN internal resize min
-MAX_IMAGE_SIZE = 800 # 3000  # Mask R-CNN internal resize max
+FOCAL_ALPHA = 0.25 # Optimized balancing factor
+FOCAL_GAMMA = 2.0  # Focusing parameter
+# Class weights to handle imbalance (BG, Class 1, 2, 3, 4)
+CLASS_WEIGHTS = [1.0, 0.8, 0.8, 2.5, 2.5] 
 
-BATCH_SIZE = 12
-NUM_WORKERS = 6
+BATCH_SIZE = 4  # Per GPU batch size. 4 * 2 GPUs = 8 total.
+NUM_WORKERS = 4
 
 NUM_EPOCHS = 100
 LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 5e-4
-LR_STEP_SIZE = 20 # 10  # Epochs before dropping Learning Rate
-LR_GAMMA = 0.05  # Factor to multiply LR by on step
+WEIGHT_DECAY = 1e-4 # Optimized weight decay
+LR_STEP_SIZE = 25   # Optimized step size
+LR_GAMMA = 0.1      # Optimized gamma
 
-MASK_THRESHOLD = 0.5  # Binarization threshold for predicted masks
-IOU_THRESHOLDS = [0.5]  # Target metric: AP50
+MASK_THRESHOLD = 0.5
+IOU_THRESHOLDS = [0.5]
 
 # ---------------------------------------------------------
-# 1. Custom Focal Loss Injection (Monkey-Patch)
+# 1. Custom Focal Loss Injection
 # ---------------------------------------------------------
 original_fastrcnn_loss = roi_heads.fastrcnn_loss
 
-
 def focal_loss_fastrcnn(class_logits, box_regression, labels, regression_targets):
-    """Replaces standard Cross Entropy with Focal Loss to combat extreme class imbalance."""
+    """Replaces standard Cross Entropy with Focal Loss with class weights."""
     labels_cat = torch.cat(labels, dim=0)
-
-    ce_loss = F.cross_entropy(class_logits, labels_cat, reduction="none")
+    
+    device = class_logits.device
+    weights = torch.tensor(CLASS_WEIGHTS, device=device)
+    
+    ce_loss = F.cross_entropy(class_logits, labels_cat, reduction="none", weight=weights)
     pt = torch.exp(-ce_loss)
-
     focal_loss = FOCAL_ALPHA * ((1 - pt) ** FOCAL_GAMMA) * ce_loss
 
     _, box_loss = original_fastrcnn_loss(class_logits, box_regression, labels, regression_targets)
@@ -66,7 +70,7 @@ def focal_loss_fastrcnn(class_logits, box_regression, labels, regression_targets
 roi_heads.fastrcnn_loss = focal_loss_fastrcnn
 
 # ---------------------------------------------------------
-# 3. Dataset Setup
+# 2. Dataset Setup
 # ---------------------------------------------------------
 class CellDataset(Dataset):
     def __init__(self, root, annotation_file, transforms=None, is_train=True):
@@ -92,15 +96,11 @@ class CellDataset(Dataset):
             labels.append(ann['category_id'])
 
         if self.transforms is not None:
-            if self.is_train:
-                transformed = self.transforms(image=img, bboxes=boxes, masks=masks, category_ids=labels)
-                img = transformed['image']
-                boxes = transformed['bboxes']
-                masks = transformed['masks']
-                labels = transformed['category_ids']
-            else:
-                transformed = self.transforms(image=img)
-                img = transformed['image']
+            transformed = self.transforms(image=img, bboxes=boxes, masks=masks, category_ids=labels)
+            img = transformed['image']
+            boxes = transformed['bboxes']
+            masks = transformed['masks']
+            labels = transformed['category_ids']
 
         boxes = torch.as_tensor(boxes, dtype=torch.float32)
         if len(boxes) == 0:
@@ -124,29 +124,37 @@ class CellDataset(Dataset):
 
 def get_transform(train):
     """
-    Bulletproof Albumentations pipeline tailored specifically for
-    fragmented medical cell microscopy.
+    Refined Albumentations 2.0 pipeline for cell microscopy.
     """
     if train:
         return A.Compose([
-            # 1. Structural
+            # 1. Geometric - Albumentations 2.0 style
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.RandomRotate90(p=0.5),
+            A.Transpose(p=0.5),
+            
+            # Robust geometric transforms using A.OneOf
+            A.OneOf([
+                A.ElasticTransform(alpha=1, sigma=50, p=0.5),
+                A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
+                A.OpticalDistortion(distort_limit=0.05, p=0.5),
+            ], p=0.3),
+            
+            A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.2, rotate_limit=45, p=0.5),
+            
+            # 2. Lighting and Texture
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+            A.RandomGamma(gamma_limit=(80, 120), p=0.5),
+            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.01, p=0.3),
+            
+            # 3. Microscope Noise/Blur
+            A.OneOf([
+                A.GaussianBlur(blur_limit=(3, 7), p=0.5),
+                A.GaussNoise(std_range=(0.01, 0.05), p=0.5),
+            ], p=0.2),
 
-            # 2. Biological Morphology
-            A.ElasticTransform(p=0.3),
-            A.GridDistortion(p=0.3),
-            A.Affine(scale=(0.9, 1.1), translate_percent=(-0.05, 0.05), rotate=(-30, 30), p=0.4),
-
-            # 3. Textural & Lighting
-            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.05, hue=0.01, p=0.4),
-
-            # 4. Microscope Artifacts
-            A.GaussianBlur(blur_limit=(3, 7), p=0.2),
-            A.GaussNoise(p=0.2),
-
-            # 5. Format for PyTorch Mask R-CNN
+            # 4. Format
             A.ToFloat(max_value=255.0),
             ToTensorV2()
         ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category_ids']))
@@ -162,169 +170,182 @@ def collate_fn(batch):
 
 
 # ---------------------------------------------------------
-# 4. Training & Validation Loop
+# 3. Training Logic
 # ---------------------------------------------------------
-def train_and_evaluate(resume_path=None):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def setup_dist(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
-    run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+def cleanup_dist():
+    dist.destroy_process_group()
+
+def train_and_evaluate(rank, world_size, args):
+    is_distributed = world_size > 1
+    if is_distributed:
+        setup_dist(rank, world_size)
+    
+    torch.cuda.set_device(rank)
+    device = torch.device('cuda', rank)
+
+    run_name = args.run_name if args.run_name else datetime.now().strftime("%Y%m%d_%H%M%S")
     run_ckpt_dir = os.path.join(CHECKPOINT_DIR, run_name)
-    os.makedirs(run_ckpt_dir, exist_ok=True)
+    if rank == 0:
+        os.makedirs(run_ckpt_dir, exist_ok=True)
 
-    use_persistent = NUM_WORKERS > 0
-    train_dataset = CellDataset(TRAIN_IMG_DIR, TRAIN_ANN_FILE, get_transform(train=True), is_train=True)
-    val_dataset = CellDataset(VAL_IMG_DIR, VAL_ANN_FILE, get_transform(train=False), is_train=False)
+    # Dataset & Dataloader
+    train_dataset = CellDataset(TRAIN_IMG_DIR, TRAIN_ANN_FILE, get_transform(train=True))
+    val_dataset = CellDataset(VAL_IMG_DIR, VAL_ANN_FILE, get_transform(train=False))
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
-                              collate_fn=collate_fn, pin_memory=True, persistent_workers=use_persistent)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS,
-                            collate_fn=collate_fn, pin_memory=True, persistent_workers=use_persistent)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank) if is_distributed else None
+    
+    train_loader = DataLoader(
+        train_dataset, batch_size=BATCH_SIZE, shuffle=(train_sampler is None),
+        num_workers=NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
+        sampler=train_sampler, persistent_workers=(NUM_WORKERS > 0)
+    )
+    
+    val_loader = DataLoader(
+        val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=NUM_WORKERS, collate_fn=collate_fn, pin_memory=True
+    )
 
-    model = build_dcnv2_mask_rcnn()
+    # Model
+    model = build_dcnv2_mask_rcnn(min_size=1, max_size=3000)
+    model.to(device)
+    
+    if is_distributed:
+        model = DDP(model, device_ids=[rank])
 
-    if torch.cuda.device_count() > 1:
-        print(f"Detected {torch.cuda.device_count()} GPUs for training")
-        model = nn.DataParallel(model)
-
-    model = model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * world_size, weight_decay=WEIGHT_DECAY)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=LR_STEP_SIZE, gamma=LR_GAMMA)
+    scaler = GradScaler()
 
     metric = MeanAveragePrecision(iou_type="segm", iou_thresholds=IOU_THRESHOLDS, class_metrics=True).to(device)
 
     start_epoch, best_ap50 = 0, 0.0
 
-    if resume_path and os.path.exists(resume_path):
-        print(f"Loading checkpoint from {resume_path}...")
-        checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
+    if args.resume and os.path.exists(args.resume):
+        if rank == 0: print(f"Loading checkpoint from {args.resume}...")
+        checkpoint = torch.load(args.resume, map_location=device)
+        model_state = checkpoint['model_state_dict']
+        if is_distributed:
+            model.module.load_state_dict(model_state)
+        else:
+            model.load_state_dict(model_state)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])  # Restores learning rate exactly
+        lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_ap50 = checkpoint.get('ap50', 0.0)
 
-        run_ckpt_dir = os.path.dirname(resume_path)
-        run_name = os.path.basename(run_ckpt_dir)
-        print(f"Resuming from epoch {start_epoch}")
-    else:
-        print(f"Starting fresh training run: {run_name}")
-
-    # 3. Initialize W&B with matching run name
-    wandb.init(
-        project="mask-rcnn-cell-detection",
-        name=run_name,
-        config={
-            "learning_rate": LEARNING_RATE,
-            "epochs": NUM_EPOCHS,
-            "batch_size": BATCH_SIZE,
-            "focal_alpha": FOCAL_ALPHA,
-            "focal_gamma": FOCAL_GAMMA,
-            "resumed_from": resume_path
-        }
-    )
-
-    latest_ckpt = os.path.join(run_ckpt_dir, "latest_model.pth")
+    if rank == 0:
+        wandb.init(
+            project="mask-rcnn-cell-detection",
+            name=run_name,
+            config={
+                "learning_rate": LEARNING_RATE,
+                "epochs": NUM_EPOCHS,
+                "batch_size": BATCH_SIZE * world_size,
+                "focal_alpha": FOCAL_ALPHA,
+                "focal_gamma": FOCAL_GAMMA,
+                "class_weights": CLASS_WEIGHTS,
+                "weight_decay": WEIGHT_DECAY,
+                "lr_step_size": LR_STEP_SIZE,
+                "lr_gamma": LR_GAMMA
+            }
+        )
 
     for epoch in range(start_epoch, NUM_EPOCHS):
-        print(f"\nEpoch {epoch + 1}/{NUM_EPOCHS}")
+        if is_distributed:
+            train_sampler.set_epoch(epoch)
+        
+        if rank == 0: print(f"\nEpoch {epoch + 1}/{NUM_EPOCHS}")
 
-        # -- TRAIN --
         model.train()
-        total_loss = 0
-
-        train_components = {"loss_classifier": 0, "loss_box_reg": 0, "loss_mask": 0, "loss_objectness": 0,
-                            "loss_rpn_box_reg": 0}
-
-        train_pbar = tqdm(train_loader, desc="Training", leave=False)
-        for images, targets in train_pbar:
+        epoch_losses = []
+        
+        pbar = tqdm(train_loader, desc=f"Rank {rank} Train", disable=(rank != 0))
+        for images, targets in pbar:
             images = [img.to(device) for img in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-            loss_dict = model(images, targets)
-            losses = sum(loss for loss in loss_dict.values())
-
             optimizer.zero_grad()
-            losses.backward()
-            optimizer.step()
+            with autocast():
+                loss_dict = model(images, targets)
+                losses = sum(loss for loss in loss_dict.values())
 
-            total_loss += losses.item()
-            for k, v in loss_dict.items():
-                train_components[k] += v.item()
+            scaler.scale(losses).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-            train_pbar.set_postfix(loss=f"{losses.item():.4f}")
+            epoch_losses.append(losses.item())
+            if rank == 0:
+                pbar.set_postfix(loss=f"{losses.item():.4f}")
 
         lr_scheduler.step()
+        avg_loss = np.mean(epoch_losses)
 
-        num_batches = len(train_loader)
-        train_loss = total_loss / num_batches
-        print(f"Epoch {epoch + 1} | Train Loss: {train_loss:.4f}")
+        # Evaluation (Only on rank 0)
+        if rank == 0:
+            model.eval()
+            metric.reset()
+            with torch.no_grad():
+                for images, targets in tqdm(val_loader, desc="Eval", leave=False):
+                    images = [img.to(device) for img in images]
+                    outputs = model(images)
+                    
+                    preds = [{"masks": out["masks"].squeeze(1) > MASK_THRESHOLD, "scores": out["scores"], "labels": out["labels"]} for out in outputs]
+                    target_metrics = [{"masks": t["masks"].to(device), "labels": t["labels"].to(device)} for t in targets]
+                    metric.update(preds, target_metrics)
 
-        wandb_train_logs = {"Train/Total_Loss": train_loss}
-        for k, v in train_components.items():
-            wandb_train_logs[f"Train_Breakdown/{k}"] = v / num_batches
-        wandb.log(wandb_train_logs, step=epoch + 1)
+            ap_metrics = metric.compute()
+            current_ap50 = ap_metrics['map_50'].item()
+            
+            print(f"Epoch {epoch + 1} | Train Loss: {avg_loss:.4f} | Val AP50: {current_ap50:.4f}")
+            
+            log_dict = {
+                "Train/Loss": avg_loss,
+                "Val/mAP_50": current_ap50,
+                "LR": optimizer.param_groups[0]['lr']
+            }
+            if 'map_per_class' in ap_metrics:
+                for idx, class_ap in enumerate(ap_metrics['map_per_class']):
+                    log_dict[f"Val_Class/AP50_C{idx+1}"] = class_ap.item()
+            wandb.log(log_dict, step=epoch + 1)
 
-        # -- EVALUATE --
-        model.eval()
-        metric.reset()
-        with torch.no_grad():
-            val_pbar = tqdm(val_loader, desc="Validation", leave=False)
-            for images, targets in val_pbar:
-                images = [img.to(device) for img in images]
-                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            # Checkpoint
+            model_to_save = model.module if is_distributed else model
+            latest_path = os.path.join(run_ckpt_dir, "latest_model.pth")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model_to_save.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'lr_scheduler_state_dict': lr_scheduler.state_dict(),
+                'ap50': current_ap50
+            }, latest_path)
 
-                outputs = model(images)
+            if current_ap50 > best_ap50:
+                best_ap50 = current_ap50
+                torch.save(model_to_save.state_dict(), os.path.join(run_ckpt_dir, "best_model.pth"))
 
-                preds = [{"masks": out["masks"].squeeze(1) > MASK_THRESHOLD, "scores": out["scores"],
-                          "labels": out["labels"]} for out in outputs]
-                target_metrics = [{"masks": t["masks"], "labels": t["labels"]} for t in targets]
-                metric.update(preds, target_metrics)
+    if rank == 0:
+        wandb.finish()
+    if is_distributed:
+        cleanup_dist()
 
-        ap_metrics = metric.compute()
-        current_ap50 = ap_metrics['map_50'].item()
-        current_ap75 = ap_metrics['map_75'].item()
-        current_recall = ap_metrics['mar_100'].item()
-
-        print(f"Epoch {epoch + 1} | Val AP50: {current_ap50:.4f} | Recall: {current_recall:.4f}")
-
-        log_metrics = {
-            "Val/mAP_50_Overall": current_ap50,
-            "Val/mAP_75_Strict": current_ap75,
-            "Val/Recall_MAR100": current_recall,
-            "LR": optimizer.param_groups[0]['lr']
-        }
-
-        if 'map_per_class' in ap_metrics:
-            for idx, class_ap in enumerate(ap_metrics['map_per_class']):
-                log_metrics[f"Val_by_Class/mAP_50_Class_{idx + 1}"] = class_ap.item()
-
-        wandb.log(log_metrics, step=epoch + 1)
-
-        # -- CHECKPOINTING --
-        model_to_save = model.module if hasattr(model, 'module') else model
-
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model_to_save.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'lr_scheduler_state_dict': lr_scheduler.state_dict(),
-            'ap50': current_ap50
-        }, latest_ckpt)
-
-        if current_ap50 > best_ap50:
-            best_ap50 = current_ap50
-            best_model_path = os.path.join(run_ckpt_dir, "best_ap50_model.pth")
-            torch.save(model_to_save.state_dict(), best_model_path)
-            print(f">>> New Best Model Saved to {best_model_path} <<<")
-
-            wandb.save(best_model_path, base_path=run_ckpt_dir)
-
-    wandb.finish()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Cell Instance Segmentation Mask R-CNN")
-    parser.add_argument("--resume", type=str, default=None, help="Path to .pth checkpoint to resume from")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--run_name", type=str, default=None)
     args = parser.parse_args()
 
-    train_and_evaluate(resume_path=args.resume)
+    world_size = torch.cuda.device_count()
+    if world_size > 1:
+        print(f"Launching distributed training on {world_size} GPUs")
+        mp.spawn(train_and_evaluate, args=(world_size, args), nprocs=world_size, join=True)
+    else:
+        print("Starting single-GPU training")
+        train_and_evaluate(0, 1, args)
+
+if __name__ == "__main__":
+    main()
