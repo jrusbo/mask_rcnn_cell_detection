@@ -27,19 +27,19 @@ VAL_ANN_FILE = "datasets/coco_format/val.json"
 CHECKPOINT_DIR = "checkpoints"
 
 NUM_CLASSES = 5  # 4 cells + 1 background
-FOCAL_ALPHA = 0.25  # Imbalance balancing factor for minority classes
+FOCAL_ALPHA = 0.1 # 0.25  # Imbalance balancing factor for minority classes
 FOCAL_GAMMA = 2.0  # Focusing parameter for hard examples
 MIN_IMAGE_SIZE = 100  # Mask R-CNN internal resize min
-MAX_IMAGE_SIZE = 800  # Mask R-CNN internal resize max
+MAX_IMAGE_SIZE = 800 # 3000  # Mask R-CNN internal resize max
 
 BATCH_SIZE = 12
 NUM_WORKERS = 6
 
-NUM_EPOCHS = 60
+NUM_EPOCHS = 100
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 5e-4
-LR_STEP_SIZE = 10  # Epochs before dropping Learning Rate
-LR_GAMMA = 0.1  # Factor to multiply LR by on step
+LR_STEP_SIZE = 20 # 10  # Epochs before dropping Learning Rate
+LR_GAMMA = 0.05  # Factor to multiply LR by on step
 
 MASK_THRESHOLD = 0.5  # Binarization threshold for predicted masks
 IOU_THRESHOLDS = [0.5]  # Target metric: AP50
