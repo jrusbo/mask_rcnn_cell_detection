@@ -6,6 +6,7 @@ import wandb
 import numpy as np
 import albumentations as A
 import torch.nn.functional as F
+import torch.nn as nn
 import torchvision.models.detection.roi_heads as roi_heads
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -35,8 +36,8 @@ FOCAL_GAMMA = 2.0  # Focusing parameter
 # Class weights to handle imbalance (BG, Class 1, 2, 3, 4)
 CLASS_WEIGHTS = [1.0, 0.8, 0.8, 2.5, 2.5] 
 
-BATCH_SIZE = 4  # Per GPU batch size. 4 * 2 GPUs = 8 total.
-NUM_WORKERS = 4
+BATCH_SIZE = 4 
+NUM_WORKERS = 2 # Reduced to avoid potential deadlocks in some environments
 
 NUM_EPOCHS = 100
 LEARNING_RATE = 1e-4
@@ -48,37 +49,34 @@ MASK_THRESHOLD = 0.5
 IOU_THRESHOLDS = [0.5]
 
 # ---------------------------------------------------------
-# 1. Custom Focal Loss Injection
+# 1. Custom Focal Loss Injection (Inside Rank Function)
 # ---------------------------------------------------------
-original_fastrcnn_loss = roi_heads.fastrcnn_loss
+def apply_focal_loss_patch():
+    original_fastrcnn_loss = roi_heads.fastrcnn_loss
 
-def focal_loss_fastrcnn(class_logits, box_regression, labels, regression_targets):
-    """Replaces standard Cross Entropy with Focal Loss with class weights."""
-    labels_cat = torch.cat(labels, dim=0)
-    
-    device = class_logits.device
-    weights = torch.tensor(CLASS_WEIGHTS, device=device)
-    
-    ce_loss = F.cross_entropy(class_logits, labels_cat, reduction="none", weight=weights)
-    pt = torch.exp(-ce_loss)
-    focal_loss = FOCAL_ALPHA * ((1 - pt) ** FOCAL_GAMMA) * ce_loss
+    def focal_loss_fastrcnn(class_logits, box_regression, labels, regression_targets):
+        labels_cat = torch.cat(labels, dim=0)
+        device = class_logits.device
+        weights = torch.tensor(CLASS_WEIGHTS, device=device)
+        
+        ce_loss = F.cross_entropy(class_logits, labels_cat, reduction="none", weight=weights)
+        pt = torch.exp(-ce_loss)
+        focal_loss = FOCAL_ALPHA * ((1 - pt) ** FOCAL_GAMMA) * ce_loss
 
-    _, box_loss = original_fastrcnn_loss(class_logits, box_regression, labels, regression_targets)
+        _, box_loss = original_fastrcnn_loss(class_logits, box_regression, labels, regression_targets)
+        return focal_loss.mean(), box_loss
 
-    return focal_loss.mean(), box_loss
-
-roi_heads.fastrcnn_loss = focal_loss_fastrcnn
+    roi_heads.fastrcnn_loss = focal_loss_fastrcnn
 
 # ---------------------------------------------------------
 # 2. Dataset Setup
 # ---------------------------------------------------------
 class CellDataset(Dataset):
-    def __init__(self, root, annotation_file, transforms=None, is_train=True):
+    def __init__(self, root, annotation_file, transforms=None):
         self.root = root
         self.coco = COCO(annotation_file)
         self.ids = list(sorted(self.coco.imgs.keys()))
         self.transforms = transforms
-        self.is_train = is_train
 
     def __getitem__(self, index):
         img_id = self.ids[index]
@@ -115,17 +113,12 @@ class CellDataset(Dataset):
             "labels": torch.as_tensor(labels, dtype=torch.int64),
             "image_id": torch.as_tensor([img_id])
         }
-
         return img, target
 
     def __len__(self):
         return len(self.ids)
 
-
 def get_transform(train):
-    """
-    Refined Albumentations 2.0 pipeline for cell microscopy.
-    """
     if train:
         return A.Compose([
             # 1. Geometric - Albumentations 2.0 style
@@ -164,53 +157,47 @@ def get_transform(train):
             ToTensorV2()
         ])
 
-
 def collate_fn(batch):
     return tuple(zip(*batch))
 
-
 # ---------------------------------------------------------
-# 3. Training Logic
+# 3. Training Loop
 # ---------------------------------------------------------
-def setup_dist(rank, world_size):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-
-def cleanup_dist():
-    dist.destroy_process_group()
-
 def train_and_evaluate(rank, world_size, args):
     is_distributed = world_size > 1
     if is_distributed:
-        setup_dist(rank, world_size)
+        os.environ['MASTER_ADDR'] = 'localhost'
+        os.environ['MASTER_PORT'] = '12355'
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        print(f"[Rank {rank}] Process group initialized.")
     
     torch.cuda.set_device(rank)
     device = torch.device('cuda', rank)
+
+    # Apply Focal Loss patch locally to this process
+    apply_focal_loss_patch()
 
     run_name = args.run_name if args.run_name else datetime.now().strftime("%Y%m%d_%H%M%S")
     run_ckpt_dir = os.path.join(CHECKPOINT_DIR, run_name)
     if rank == 0:
         os.makedirs(run_ckpt_dir, exist_ok=True)
 
-    # Dataset & Dataloader
     train_dataset = CellDataset(TRAIN_IMG_DIR, TRAIN_ANN_FILE, get_transform(train=True))
     val_dataset = CellDataset(VAL_IMG_DIR, VAL_ANN_FILE, get_transform(train=False))
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank) if is_distributed else None
-    
     train_loader = DataLoader(
         train_dataset, batch_size=BATCH_SIZE, shuffle=(train_sampler is None),
         num_workers=NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
         sampler=train_sampler, persistent_workers=(NUM_WORKERS > 0)
     )
     
-    val_loader = DataLoader(
-        val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-        num_workers=NUM_WORKERS, collate_fn=collate_fn, pin_memory=True
-    )
+    if rank == 0:
+        val_loader = DataLoader(
+            val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+            num_workers=NUM_WORKERS, collate_fn=collate_fn, pin_memory=True
+        )
 
-    # Model
     model = build_dcnv2_mask_rcnn(min_size=1, max_size=3000)
     model.to(device)
     
@@ -226,7 +213,6 @@ def train_and_evaluate(rank, world_size, args):
     start_epoch, best_ap50 = 0, 0.0
 
     if args.resume and os.path.exists(args.resume):
-        if rank == 0: print(f"Loading checkpoint from {args.resume}...")
         checkpoint = torch.load(args.resume, map_location=device)
         model_state = checkpoint['model_state_dict']
         if is_distributed:
@@ -239,32 +225,16 @@ def train_and_evaluate(rank, world_size, args):
         best_ap50 = checkpoint.get('ap50', 0.0)
 
     if rank == 0:
-        wandb.init(
-            project="mask-rcnn-cell-detection",
-            name=run_name,
-            config={
-                "learning_rate": LEARNING_RATE,
-                "epochs": NUM_EPOCHS,
-                "batch_size": BATCH_SIZE * world_size,
-                "focal_alpha": FOCAL_ALPHA,
-                "focal_gamma": FOCAL_GAMMA,
-                "class_weights": CLASS_WEIGHTS,
-                "weight_decay": WEIGHT_DECAY,
-                "lr_step_size": LR_STEP_SIZE,
-                "lr_gamma": LR_GAMMA
-            }
-        )
+        wandb.init(project="mask-rcnn-cell-detection", name=run_name, config=vars(args))
 
     for epoch in range(start_epoch, NUM_EPOCHS):
         if is_distributed:
             train_sampler.set_epoch(epoch)
         
-        if rank == 0: print(f"\nEpoch {epoch + 1}/{NUM_EPOCHS}")
-
         model.train()
         epoch_losses = []
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} Rank {rank}", disable=(rank != 0))
         
-        pbar = tqdm(train_loader, desc=f"Rank {rank} Train", disable=(rank != 0))
         for images, targets in pbar:
             images = [img.to(device) for img in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
@@ -283,7 +253,6 @@ def train_and_evaluate(rank, world_size, args):
                 pbar.set_postfix(loss=f"{losses.item():.4f}")
 
         lr_scheduler.step()
-        avg_loss = np.mean(epoch_losses)
 
         # Evaluation (Only on rank 0)
         if rank == 0:
@@ -293,45 +262,40 @@ def train_and_evaluate(rank, world_size, args):
                 for images, targets in tqdm(val_loader, desc="Eval", leave=False):
                     images = [img.to(device) for img in images]
                     outputs = model(images)
-                    
                     preds = [{"masks": out["masks"].squeeze(1) > MASK_THRESHOLD, "scores": out["scores"], "labels": out["labels"]} for out in outputs]
                     target_metrics = [{"masks": t["masks"].to(device), "labels": t["labels"].to(device)} for t in targets]
                     metric.update(preds, target_metrics)
 
             ap_metrics = metric.compute()
             current_ap50 = ap_metrics['map_50'].item()
+            print(f"Epoch {epoch + 1} | Loss: {np.mean(epoch_losses):.4f} | AP50: {current_ap50:.4f}")
             
-            print(f"Epoch {epoch + 1} | Train Loss: {avg_loss:.4f} | Val AP50: {current_ap50:.4f}")
-            
-            log_dict = {
-                "Train/Loss": avg_loss,
-                "Val/mAP_50": current_ap50,
-                "LR": optimizer.param_groups[0]['lr']
-            }
-            if 'map_per_class' in ap_metrics:
-                for idx, class_ap in enumerate(ap_metrics['map_per_class']):
-                    log_dict[f"Val_Class/AP50_C{idx+1}"] = class_ap.item()
-            wandb.log(log_dict, step=epoch + 1)
+            wandb.log({"Train/Loss": np.mean(epoch_losses), "Val/AP50": current_ap50, "LR": optimizer.param_groups[0]['lr']}, step=epoch+1)
 
             # Checkpoint
             model_to_save = model.module if is_distributed else model
-            latest_path = os.path.join(run_ckpt_dir, "latest_model.pth")
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model_to_save.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'lr_scheduler_state_dict': lr_scheduler.state_dict(),
                 'ap50': current_ap50
-            }, latest_path)
+            }, os.path.join(run_ckpt_dir, "latest_model.pth"))
 
             if current_ap50 > best_ap50:
                 best_ap50 = current_ap50
-                torch.save(model_to_save.state_dict(), os.path.join(run_ckpt_dir, "best_model.pth"))
+                best_model_path = os.path.join(run_ckpt_dir, "best_model.pth")
+                torch.save(model_to_save.state_dict(), best_model_path)
+                print(f">>> New Best Model Saved to {best_model_path} <<<")
 
     if rank == 0:
+        best_model_path = os.path.join(run_ckpt_dir, "best_model.pth")
+        if os.path.exists(best_model_path):
+            print(f"Uploading best model to W&B: {best_model_path}")
+            wandb.save(best_model_path, base_path=run_ckpt_dir)
         wandb.finish()
     if is_distributed:
-        cleanup_dist()
+        dist.destroy_process_group()
 
 def main():
     parser = argparse.ArgumentParser()
@@ -342,6 +306,11 @@ def main():
     world_size = torch.cuda.device_count()
     if world_size > 1:
         print(f"Launching distributed training on {world_size} GPUs")
+        # Ensure multiprocessing uses 'spawn' which is safer for CUDA
+        try:
+            mp.set_start_method('spawn', force=True)
+        except RuntimeError:
+            pass
         mp.spawn(train_and_evaluate, args=(world_size, args), nprocs=world_size, join=True)
     else:
         print("Starting single-GPU training")
