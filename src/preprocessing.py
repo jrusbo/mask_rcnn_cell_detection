@@ -10,7 +10,7 @@ from tqdm import tqdm
 from tiling_utils import get_tile_coords_for_full_image
 
 
-RAW_DATA_DIR = "/kaggle/input/datasets/quinonycu/hw3-maskrcnn/train" # "datasets/train"
+RAW_DATA_DIR = r"C:\Users\JoaquinRusBono\git_workspace\personal\mask_rcnn_cell_detection\datasets\train" # "datasets/train"
 OUT_DIR = "datasets/coco_format"
 USE_TILING = True  # Set to False to support full image without tiling
 PATCH_SIZE = 512

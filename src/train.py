@@ -35,7 +35,7 @@ FOCAL_GAMMA = 2.0  # Focusing parameter
 # Class weights to handle imbalance (BG, Class 1, 2, 3, 4)
 CLASS_WEIGHTS = [1.0, 0.8, 0.8, 2.5, 2.5] 
 
-BATCH_SIZE = 4 
+BATCH_SIZE = 2
 NUM_WORKERS = 4
 
 NUM_EPOCHS = 100
@@ -46,6 +46,15 @@ LR_GAMMA = 0.1
 
 MASK_THRESHOLD = 0.5
 IOU_THRESHOLDS = [0.5]
+
+# To prevent resizing while avoiding the 'output size 0' crash:
+# torchvision.models.detection.transform.GeneralizedRCNNTransform handles resizing.
+# If min_size is less than or equal to the smallest edge of the image, 
+# AND max_size is greater than or equal to the largest edge, NO RESIZING occurs.
+# We set min_size=32 as a safety floor (ResNet50 FPN has a total stride of 32).
+# This ensures images are at least 32x32 without resizing your 512x512 tiles.
+MIN_SIZE = 32
+MAX_SIZE = 4096
 
 # ---------------------------------------------------------
 # 1. Custom Focal Loss Injection
@@ -128,33 +137,47 @@ class CellDataset(Dataset):
 def get_transform(train):
     if train:
         return A.Compose([
-            # 1. Geometric - Albumentations 2.0 style
+            # 1. Geometric
+            # Cells are orientation-invariant, so flips and 90-deg rotations are safe.
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.RandomRotate90(p=0.5),
             A.Transpose(p=0.5),
             
-            # Robust geometric transforms using A.OneOf
+            # 2. Local Deformations
+            # ElasticTransform is excellent for biological cells as it simulates 
+            # natural shape variation without changing semantic content.
             A.OneOf([
                 A.ElasticTransform(alpha=1, sigma=50, p=0.5),
-                A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
+                A.GridDistortion(num_steps=5, distort_limit=0.1, p=0.5),
                 A.OpticalDistortion(distort_limit=0.05, p=0.5),
             ], p=0.3),
             
-            A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.2, rotate_limit=45, p=0.5),
-            
-            # 2. Lighting and Texture
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-            A.RandomGamma(gamma_limit=(80, 120), p=0.5),
-            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.01, p=0.3),
-            
-            # 3. Microscope Noise/Blur
+            # 3. Global Geometric (Affine)
+            # Conservative affine: slight shifting and scaling are fine.
+            # Scaling (0.9 to 1.1) preserves cell size context while adding robustness.
+            # Rotating (-15 to 15) adds diversity beyond 90-deg snaps.
+            # Shear is omitted as it can unrealistically stretch cell membranes.
+            A.Affine(
+                translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
+                scale=(0.9, 1.1),
+                rotate=(-15, 15),
+                shear=0, 
+                p=0.4
+            ),
+
+            # 4. Intensity / Lighting
+            A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=0.5),
+            A.RandomGamma(gamma_limit=(90, 110), p=0.5),
+            A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.01, p=0.3),
+
+            # 5. Noise (Simulating sensor noise or focus issues)
             A.OneOf([
-                A.GaussianBlur(blur_limit=(3, 7), p=0.5),
-                A.GaussNoise(std_range=(0.01, 0.05), p=0.5),
+                A.GaussianBlur(blur_limit=(3, 5), p=0.5),
+                A.GaussNoise(std_range=(0.01, 0.03), p=0.5),
             ], p=0.2),
 
-            # 4. Format
+            # 6. Format
             A.ToFloat(max_value=255.0),
             ToTensorV2()
         ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category_ids'], min_area=1))
@@ -175,9 +198,10 @@ def train_and_evaluate(rank, world_size, args):
     if is_distributed:
         os.environ['MASTER_ADDR'] = 'localhost'
         os.environ['MASTER_PORT'] = '12355'
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        # Fix: use 'nccl' for NVIDIA GPUs, ensure rank/world_size are integers
+        dist.init_process_group("nccl", rank=int(rank), world_size=int(world_size))
         print(f"[Rank {rank}] DDP initialized.")
-    
+
     torch.cuda.set_device(rank)
     device = torch.device('cuda', rank)
 
@@ -192,7 +216,8 @@ def train_and_evaluate(rank, world_size, args):
     train_dataset = CellDataset(TRAIN_IMG_DIR, TRAIN_ANN_FILE, get_transform(train=True))
     val_dataset = CellDataset(VAL_IMG_DIR, VAL_ANN_FILE, get_transform(train=False))
 
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank) if is_distributed else None
+    # Fix: Always use DistributedSampler if world_size > 1
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if is_distributed else None
     train_loader = DataLoader(
         train_dataset, batch_size=BATCH_SIZE, shuffle=(train_sampler is None),
         num_workers=NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
@@ -205,8 +230,9 @@ def train_and_evaluate(rank, world_size, args):
             num_workers=NUM_WORKERS, collate_fn=collate_fn, pin_memory=True
         )
 
-    # Consistent with tiling_utils and preprocessing
-    model = build_dcnv2_mask_rcnn(min_size=1, max_size=3000)
+    # MIN_SIZE=32 ensures no downscaling for your 512px images, 
+    # but provides a safe floor for the model's stride-32 FPN.
+    model = build_dcnv2_mask_rcnn(min_size=MIN_SIZE, max_size=MAX_SIZE)
     model.to(device)
     
     if is_distributed:

@@ -36,9 +36,10 @@ def generate_submission(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Loading model from {args.model} on {device}...")
 
-    # Set min_size=1 and max_size=3000 to prevent resizing/upscaling
-    # This allows processing full images at their native resolution.
-    model = build_dcnv2_mask_rcnn(min_size=1, max_size=3000)
+    # Use min_size=32 and max_size=4096 to prevent resizing of images.
+    # Images smaller than 32px will be upscaled slightly to 32px to satisfy model strides.
+    # Images 512px or larger (up to 4096px) will remain at native resolution.
+    model = build_dcnv2_mask_rcnn(min_size=32, max_size=4096)
 
     if not os.path.exists(args.model):
         raise FileNotFoundError(f"Checkpoint not found at: {args.model}")
