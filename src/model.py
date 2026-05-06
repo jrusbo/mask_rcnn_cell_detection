@@ -61,8 +61,13 @@ def build_dcnv2_mask_rcnn(num_classes=5, min_size=None, max_size=None, anchor_si
         num_classes=num_classes,
         min_size=actual_min_size,
         max_size=actual_max_size,
-        rpn_anchor_generator=anchor_generator
     )
+
+    # Replace the default anchor generator with our custom one.
+    # We do this after initialization because the V2 builder doesn't allow overriding it via kwargs.
+    # This works as long as the number of anchors per location (aspect ratios * sizes per level) 
+    # remains consistent with what the RPN head was initialized with.
+    model.rpn.anchor_generator = anchor_generator
 
     # Inject DCNv2 into the later stages of the ResNet backbone (Stage 3 and 4)
     # These stages handle higher-level semantic features where deformation is most useful.
