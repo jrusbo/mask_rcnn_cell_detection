@@ -31,7 +31,7 @@ FOCAL_GAMMA = 2.0  # Focusing parameter for hard examples
 MIN_IMAGE_SIZE = 100  # Mask R-CNN internal resize min
 MAX_IMAGE_SIZE = 3000  # Mask R-CNN internal resize max
 
-BATCH_SIZE = 1
+BATCH_SIZE = 12
 NUM_WORKERS = 4
 
 NUM_EPOCHS = 60
