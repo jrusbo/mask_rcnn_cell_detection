@@ -6,7 +6,6 @@ import wandb
 import numpy as np
 import albumentations as A
 import torch.nn.functional as F
-import torch.nn as nn
 import torchvision.models.detection.roi_heads as roi_heads
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -35,7 +34,7 @@ FOCAL_GAMMA = 2.0  # Focusing parameter
 # Class weights to handle imbalance (BG, Class 1, 2, 3, 4)
 CLASS_WEIGHTS = [1.0, 0.8, 0.8, 2.5, 2.5] 
 
-BATCH_SIZE = 2
+BATCH_SIZE = 8
 NUM_WORKERS = 4
 
 NUM_EPOCHS = 100
