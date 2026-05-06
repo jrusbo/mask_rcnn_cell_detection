@@ -17,7 +17,6 @@ from torchmetrics.detection.mean_ap import MeanAveragePrecision
 from albumentations.pytorch import ToTensorV2
 from tqdm.auto import tqdm
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import GradScaler, autocast
 
 from model import build_dcnv2_mask_rcnn
 
@@ -37,22 +36,24 @@ FOCAL_GAMMA = 2.0  # Focusing parameter
 CLASS_WEIGHTS = [1.0, 0.8, 0.8, 2.5, 2.5] 
 
 BATCH_SIZE = 4 
-NUM_WORKERS = 2 # Reduced to avoid potential deadlocks in some environments
+NUM_WORKERS = 4
 
 NUM_EPOCHS = 100
 LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 1e-4 # Optimized weight decay
-LR_STEP_SIZE = 25   # Optimized step size
-LR_GAMMA = 0.1      # Optimized gamma
+WEIGHT_DECAY = 1e-4
+LR_STEP_SIZE = 25
+LR_GAMMA = 0.1
 
 MASK_THRESHOLD = 0.5
 IOU_THRESHOLDS = [0.5]
 
 # ---------------------------------------------------------
-# 1. Custom Focal Loss Injection (Inside Rank Function)
+# 1. Custom Focal Loss Injection
 # ---------------------------------------------------------
 def apply_focal_loss_patch():
-    original_fastrcnn_loss = roi_heads.fastrcnn_loss
+    # Store original locally to avoid infinite recursion if re-called
+    if not hasattr(roi_heads, "_original_fastrcnn_loss"):
+        roi_heads._original_fastrcnn_loss = roi_heads.fastrcnn_loss
 
     def focal_loss_fastrcnn(class_logits, box_regression, labels, regression_targets):
         labels_cat = torch.cat(labels, dim=0)
@@ -63,7 +64,7 @@ def apply_focal_loss_patch():
         pt = torch.exp(-ce_loss)
         focal_loss = FOCAL_ALPHA * ((1 - pt) ** FOCAL_GAMMA) * ce_loss
 
-        _, box_loss = original_fastrcnn_loss(class_logits, box_regression, labels, regression_targets)
+        _, box_loss = roi_heads._original_fastrcnn_loss(class_logits, box_regression, labels, regression_targets)
         return focal_loss.mean(), box_loss
 
     roi_heads.fastrcnn_loss = focal_loss_fastrcnn
@@ -83,12 +84,18 @@ class CellDataset(Dataset):
         anns = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
         path = self.coco.loadImgs(img_id)[0]['file_name']
 
-        img = cv2.imread(os.path.join(self.root, path))
+        img_full_path = os.path.join(self.root, path)
+        img = cv2.imread(img_full_path)
+        if img is None:
+            raise FileNotFoundError(f"Image not found: {img_full_path}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         boxes, masks, labels = [], [], []
         for ann in anns:
             xmin, ymin, w, h = ann['bbox']
+            # Safeguard against degenerate boxes
+            if w <= 0 or h <= 0: continue
+            
             boxes.append([xmin, ymin, xmin + w, ymin + h])
             masks.append(self.coco.annToMask(ann))
             labels.append(ann['category_id'])
@@ -150,7 +157,7 @@ def get_transform(train):
             # 4. Format
             A.ToFloat(max_value=255.0),
             ToTensorV2()
-        ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category_ids']))
+        ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category_ids'], min_area=1))
     else:
         return A.Compose([
             A.ToFloat(max_value=255.0),
@@ -169,12 +176,12 @@ def train_and_evaluate(rank, world_size, args):
         os.environ['MASTER_ADDR'] = 'localhost'
         os.environ['MASTER_PORT'] = '12355'
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
-        print(f"[Rank {rank}] Process group initialized.")
+        print(f"[Rank {rank}] DDP initialized.")
     
     torch.cuda.set_device(rank)
     device = torch.device('cuda', rank)
 
-    # Apply Focal Loss patch locally to this process
+    # Patch torchvision locally in this process
     apply_focal_loss_patch()
 
     run_name = args.run_name if args.run_name else datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -198,27 +205,32 @@ def train_and_evaluate(rank, world_size, args):
             num_workers=NUM_WORKERS, collate_fn=collate_fn, pin_memory=True
         )
 
+    # Consistent with tiling_utils and preprocessing
     model = build_dcnv2_mask_rcnn(min_size=1, max_size=3000)
     model.to(device)
     
     if is_distributed:
         model = DDP(model, device_ids=[rank])
 
+    # Scale LR by world_size for stability in DDP
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * world_size, weight_decay=WEIGHT_DECAY)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=LR_STEP_SIZE, gamma=LR_GAMMA)
-    scaler = GradScaler()
+    
+    # Modern AMP API (Torch 2.x+)
+    scaler = torch.amp.GradScaler('cuda')
 
     metric = MeanAveragePrecision(iou_type="segm", iou_thresholds=IOU_THRESHOLDS, class_metrics=True).to(device)
 
     start_epoch, best_ap50 = 0, 0.0
 
     if args.resume and os.path.exists(args.resume):
+        if rank == 0: print(f"Resuming from {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device)
-        model_state = checkpoint['model_state_dict']
+        state_dict = checkpoint['model_state_dict']
         if is_distributed:
-            model.module.load_state_dict(model_state)
+            model.module.load_state_dict(state_dict)
         else:
-            model.load_state_dict(model_state)
+            model.load_state_dict(state_dict)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
@@ -227,75 +239,80 @@ def train_and_evaluate(rank, world_size, args):
     if rank == 0:
         wandb.init(project="mask-rcnn-cell-detection", name=run_name, config=vars(args))
 
-    for epoch in range(start_epoch, NUM_EPOCHS):
-        if is_distributed:
-            train_sampler.set_epoch(epoch)
-        
-        model.train()
-        epoch_losses = []
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} Rank {rank}", disable=(rank != 0))
-        
-        for images, targets in pbar:
-            images = [img.to(device) for img in images]
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
-            optimizer.zero_grad()
-            with autocast():
-                loss_dict = model(images, targets)
-                losses = sum(loss for loss in loss_dict.values())
-
-            scaler.scale(losses).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            epoch_losses.append(losses.item())
-            if rank == 0:
-                pbar.set_postfix(loss=f"{losses.item():.4f}")
-
-        lr_scheduler.step()
-
-        # Evaluation (Only on rank 0)
-        if rank == 0:
-            model.eval()
-            metric.reset()
-            with torch.no_grad():
-                for images, targets in tqdm(val_loader, desc="Eval", leave=False):
-                    images = [img.to(device) for img in images]
-                    outputs = model(images)
-                    preds = [{"masks": out["masks"].squeeze(1) > MASK_THRESHOLD, "scores": out["scores"], "labels": out["labels"]} for out in outputs]
-                    target_metrics = [{"masks": t["masks"].to(device), "labels": t["labels"].to(device)} for t in targets]
-                    metric.update(preds, target_metrics)
-
-            ap_metrics = metric.compute()
-            current_ap50 = ap_metrics['map_50'].item()
-            print(f"Epoch {epoch + 1} | Loss: {np.mean(epoch_losses):.4f} | AP50: {current_ap50:.4f}")
+    try:
+        for epoch in range(start_epoch, NUM_EPOCHS):
+            if is_distributed:
+                train_sampler.set_epoch(epoch)
             
-            wandb.log({"Train/Loss": np.mean(epoch_losses), "Val/AP50": current_ap50, "LR": optimizer.param_groups[0]['lr']}, step=epoch+1)
+            model.train()
+            epoch_losses = []
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} Rank {rank}", disable=(rank != 0))
+            
+            for images, targets in pbar:
+                images = [img.to(device) for img in images]
+                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-            # Checkpoint
-            model_to_save = model.module if is_distributed else model
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model_to_save.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'lr_scheduler_state_dict': lr_scheduler.state_dict(),
-                'ap50': current_ap50
-            }, os.path.join(run_ckpt_dir, "latest_model.pth"))
+                optimizer.zero_grad()
+                # Modern AMP API
+                with torch.amp.autocast('cuda'):
+                    loss_dict = model(images, targets)
+                    losses = sum(loss for loss in loss_dict.values())
 
-            if current_ap50 > best_ap50:
-                best_ap50 = current_ap50
-                best_model_path = os.path.join(run_ckpt_dir, "best_model.pth")
-                torch.save(model_to_save.state_dict(), best_model_path)
-                print(f">>> New Best Model Saved to {best_model_path} <<<")
+                scaler.scale(losses).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
-    if rank == 0:
-        best_model_path = os.path.join(run_ckpt_dir, "best_model.pth")
-        if os.path.exists(best_model_path):
-            print(f"Uploading best model to W&B: {best_model_path}")
-            wandb.save(best_model_path, base_path=run_ckpt_dir)
-        wandb.finish()
-    if is_distributed:
-        dist.destroy_process_group()
+                epoch_losses.append(losses.item())
+                if rank == 0:
+                    pbar.set_postfix(loss=f"{losses.item():.4f}")
+
+            lr_scheduler.step()
+
+            if rank == 0:
+                model.eval()
+                metric.reset()
+                with torch.no_grad():
+                    for images, targets in tqdm(val_loader, desc="Eval", leave=False):
+                        images = [img.to(device) for img in images]
+                        outputs = model(images)
+                        preds = [{"masks": out["masks"].squeeze(1) > MASK_THRESHOLD, "scores": out["scores"], "labels": out["labels"]} for out in outputs]
+                        target_metrics = [{"masks": t["masks"].to(device), "labels": t["labels"].to(device)} for t in targets]
+                        metric.update(preds, target_metrics)
+
+                ap_metrics = metric.compute()
+                current_ap50 = ap_metrics['map_50'].item()
+                avg_loss = np.mean(epoch_losses)
+                print(f"Epoch {epoch + 1} | Loss: {avg_loss:.4f} | AP50: {current_ap50:.4f}")
+                
+                wandb.log({"Train/Loss": avg_loss, "Val/AP50": current_ap50, "LR": optimizer.param_groups[0]['lr']}, step=epoch+1)
+
+                model_to_save = model.module if is_distributed else model
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model_to_save.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'lr_scheduler_state_dict': lr_scheduler.state_dict(),
+                    'ap50': current_ap50
+                }, os.path.join(run_ckpt_dir, "latest_model.pth"))
+
+                if current_ap50 > best_ap50:
+                    best_ap50 = current_ap50
+                    best_model_path = os.path.join(run_ckpt_dir, "best_model.pth")
+                    torch.save(model_to_save.state_dict(), best_model_path)
+                    print(f">>> New Best Model Saved to {best_model_path} <<<")
+    
+    except Exception as e:
+        print(f"Error on Rank {rank}: {e}")
+        raise e
+    finally:
+        if rank == 0:
+            best_model_path = os.path.join(run_ckpt_dir, "best_model.pth")
+            if os.path.exists(best_model_path):
+                print(f"Uploading best model to W&B: {best_model_path}")
+                wandb.save(best_model_path, base_path=run_ckpt_dir)
+            wandb.finish()
+        if is_distributed:
+            dist.destroy_process_group()
 
 def main():
     parser = argparse.ArgumentParser()
@@ -305,8 +322,7 @@ def main():
 
     world_size = torch.cuda.device_count()
     if world_size > 1:
-        print(f"Launching distributed training on {world_size} GPUs")
-        # Ensure multiprocessing uses 'spawn' which is safer for CUDA
+        print(f"Launching DDP with {world_size} GPUs")
         try:
             mp.set_start_method('spawn', force=True)
         except RuntimeError:
