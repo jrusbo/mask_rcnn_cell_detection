@@ -34,7 +34,7 @@ FOCAL_GAMMA = 2.0  # Focusing parameter
 # Class weights to handle imbalance (BG, Class 1, 2, 3, 4)
 CLASS_WEIGHTS = [1.0, 0.8, 0.8, 2.5, 2.5] 
 
-BATCH_SIZE = 8
+BATCH_SIZE = 12
 NUM_WORKERS = 4
 
 NUM_EPOCHS = 100
@@ -46,13 +46,8 @@ LR_GAMMA = 0.1
 MASK_THRESHOLD = 0.5
 IOU_THRESHOLDS = [0.5]
 
-# To prevent resizing while avoiding the 'output size 0' crash:
-# torchvision.models.detection.transform.GeneralizedRCNNTransform handles resizing.
-# If min_size is less than or equal to the smallest edge of the image, 
-# AND max_size is greater than or equal to the largest edge, NO RESIZING occurs.
-# We set min_size=32 as a safety floor (ResNet50 FPN has a total stride of 32).
-# This ensures images are at least 32x32 without resizing your 512x512 tiles.
-MIN_SIZE = 32
+# Target size matches our padded tile size exactly to ensure scale factor = 1.0 (No resizing)
+MIN_SIZE = 512
 MAX_SIZE = 4096
 
 # ---------------------------------------------------------
@@ -325,6 +320,9 @@ def train_and_evaluate(rank, world_size, args):
                     best_model_path = os.path.join(run_ckpt_dir, "best_model.pth")
                     torch.save(model_to_save.state_dict(), best_model_path)
                     print(f">>> New Best Model Saved to {best_model_path} <<<")
+
+            if is_distributed:
+                dist.barrier()
     
     except Exception as e:
         print(f"Error on Rank {rank}: {e}")
