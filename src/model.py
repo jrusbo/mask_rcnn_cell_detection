@@ -42,12 +42,9 @@ def build_dcnv2_mask_rcnn(num_classes=5, min_size=None, max_size=None, anchor_si
         # Optimized for small cells
         anchor_sizes = ((16,), (32,), (64,), (128,), (256,))
 
-    # Torchvision defaults if not provided, but we allow None to prevent forced resizing
-    # Mask R-CNN typically uses 800/1333, but for tiles we often want to keep them as is.
-    # We will pass these to the model; if None, we'll let the model handle its internal defaults
-    # or better yet, set them to very small/large values to 'disable' resizing.
-    actual_min_size = min_size if min_size is not None else 32
-    actual_max_size = max_size if max_size is not None else 4096
+        # Fallback to standard PyTorch defaults if not explicitly provided
+        actual_min_size = min_size if min_size is not None else 800
+        actual_max_size = max_size if max_size is not None else 1333
 
     from torchvision.models.detection.anchor_utils import AnchorGenerator
     anchor_generator = AnchorGenerator(
