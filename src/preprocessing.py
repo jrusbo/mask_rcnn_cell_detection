@@ -10,12 +10,11 @@ from tqdm import tqdm
 from tiling_utils import get_tile_coords_for_full_image
 
 
-RAW_DATA_DIR = r"C:\Users\JoaquinRusBono\git_workspace\personal\mask_rcnn_cell_detection\datasets\train" # "datasets/train"
+RAW_DATA_DIR = r"/kaggle/input/datasets/quinonycu/hw3-maskrcnn/train" # "datasets/train"
 OUT_DIR = "datasets/coco_format"
 USE_TILING = True  # Set to False to support full image without tiling
 PATCH_SIZE = 512
 OVERLAP = 0.25  # 25% overlap between adjacent tiles
-THRESHOLD = 0
 KERNEL_SIZE = (1, 1)
 MIN_AREA = 20
 RANDOM_SEED = 42
@@ -132,6 +131,21 @@ def process_sample(sample_folder, is_val=False):
         if actual_h == 0 or actual_w == 0:
             continue
 
+        pad_h = PATCH_SIZE - actual_h
+        pad_w = PATCH_SIZE - actual_w
+
+        # Split the padding equally to center the image
+        top_pad = pad_h // 2
+        bottom_pad = pad_h - top_pad
+        left_pad = pad_w // 2
+        right_pad = pad_w - left_pad
+
+        if pad_h > 0 or pad_w > 0:
+            # Pad the image equally on opposite sides
+            cropped = cv2.copyMakeBorder(cropped, top_pad, bottom_pad, left_pad, right_pad, cv2.BORDER_CONSTANT,
+                                         value=[0, 0, 0])
+            actual_h, actual_w = cropped.shape[:2]  # Now guarantees 512x512
+
         patch_filename = f"{os.path.basename(sample_folder)}_{x_min}_{y_min}.jpg"
         cv2.imwrite(os.path.join(OUT_DIR, f"images/{split_str}", patch_filename),
                     cv2.cvtColor(cropped, cv2.COLOR_RGB2BGR))
@@ -157,6 +171,10 @@ def process_sample(sample_folder, is_val=False):
                 mask_map = mask_map.astype(np.uint16) if mask_map.max() > 255 else mask_map.astype(np.uint8)
 
             patch_mask_map = mask_map[y_min:y_max, x_min:x_max]
+
+            if pad_h > 0 or pad_w > 0:
+                patch_mask_map = cv2.copyMakeBorder(patch_mask_map, top_pad, bottom_pad, left_pad, right_pad,
+                                                    cv2.BORDER_CONSTANT, value=0)
 
             # In this dataset, instances might be encoded as unique float numbers
             for inst_id in np.unique(patch_mask_map):
