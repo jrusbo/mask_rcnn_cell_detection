@@ -35,7 +35,7 @@ FOCAL_GAMMA = 2.0  # Focusing parameter
 CLASS_WEIGHTS = [1.0, 0.8, 0.8, 2.5, 2.5] 
 
 BATCH_SIZE = 12
-NUM_WORKERS = 4
+NUM_WORKERS = 2
 
 NUM_EPOCHS = 100
 LEARNING_RATE = 1e-4
@@ -217,12 +217,14 @@ def train_and_evaluate(rank, world_size, args):
         num_workers=NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
         sampler=train_sampler, persistent_workers=(NUM_WORKERS > 0)
     )
-    
-    if rank == 0:
-        val_loader = DataLoader(
-            val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-            num_workers=NUM_WORKERS, collate_fn=collate_fn, pin_memory=True
-        )
+
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank,
+                                     shuffle=False) if is_distributed else None
+    val_loader = DataLoader(
+        val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
+        sampler=val_sampler
+    )
 
     # MIN_SIZE=32 ensures no downscaling for your 512px images, 
     # but provides a safe floor for the model's stride-32 FPN.
@@ -288,23 +290,34 @@ def train_and_evaluate(rank, world_size, args):
 
             lr_scheduler.step()
 
-            if rank == 0:
-                model.eval()
-                metric.reset()
-                with torch.no_grad():
-                    for images, targets in tqdm(val_loader, desc="Eval", leave=False):
-                        images = [img.to(device) for img in images]
-                        outputs = model(images)
-                        preds = [{"masks": out["masks"].squeeze(1) > MASK_THRESHOLD, "scores": out["scores"], "labels": out["labels"]} for out in outputs]
-                        target_metrics = [{"masks": t["masks"].to(device), "labels": t["labels"].to(device)} for t in targets]
-                        metric.update(preds, target_metrics)
+            model.eval()
+            metric.reset()
 
-                ap_metrics = metric.compute()
-                current_ap50 = ap_metrics['map_50'].item()
+            # Only rank 0 gets the tqdm progress bar to avoid console spam
+            val_pbar = tqdm(val_loader, desc="Eval", leave=False) if rank == 0 else val_loader
+
+            with torch.no_grad():
+                for images, targets in val_pbar:
+                    images = [img.to(device) for img in images]
+                    # Ensure targets are properly extracted and moved to device
+                    outputs = model(images)
+                    preds = [{"masks": out["masks"].squeeze(1) > MASK_THRESHOLD, "scores": out["scores"],
+                              "labels": out["labels"]} for out in outputs]
+                    target_metrics = [{"masks": t["masks"].to(device), "labels": t["labels"].to(device)} for t in
+                                      targets]
+                    metric.update(preds, target_metrics)
+
+            # Torchmetrics automatically gathers the results from BOTH GPUs here safely!
+            ap_metrics = metric.compute()
+            current_ap50 = ap_metrics['map_50'].item()
+
+            # --- CHANGE: Only Rank 0 logs, prints, and saves ---
+            if rank == 0:
                 avg_loss = np.mean(epoch_losses)
                 print(f"Epoch {epoch + 1} | Loss: {avg_loss:.4f} | AP50: {current_ap50:.4f}")
-                
-                wandb.log({"Train/Loss": avg_loss, "Val/AP50": current_ap50, "LR": optimizer.param_groups[0]['lr']}, step=epoch+1)
+
+                wandb.log({"Train/Loss": avg_loss, "Val/AP50": current_ap50, "LR": optimizer.param_groups[0]['lr']},
+                          step=epoch + 1)
 
                 model_to_save = model.module if is_distributed else model
                 torch.save({
@@ -322,7 +335,7 @@ def train_and_evaluate(rank, world_size, args):
                     print(f">>> New Best Model Saved to {best_model_path} <<<")
 
             if is_distributed:
-                dist.barrier()
+                dist.barrier(device_ids=[rank])
     
     except Exception as e:
         print(f"Error on Rank {rank}: {e}")
