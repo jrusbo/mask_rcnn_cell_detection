@@ -112,10 +112,13 @@ def build_dcnv2_mask_rcnn(
 
     model = maskrcnn_resnet50_fpn_v2(
         weights=None,
-        weights_backbone=ResNet50_Weights.IMAGENET1K_V1,
+        weights_backbone=ResNet50_Weights.IMAGENET1K_V2,
         num_classes=num_classes,
         min_size=actual_min_size,
         max_size=actual_max_size,
+        box_score_thresh=0.05,  # Keep low to catch faint cells
+        box_nms_thresh = 0.55,  # Increased from default 0.5 to allow more overlap
+        box_detections_per_img = 300  # Increased from 100 to handle dense clusters
     )
 
     # Replace the default anchor generator with our custom one.

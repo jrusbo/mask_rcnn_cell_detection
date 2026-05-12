@@ -32,14 +32,14 @@ CHECKPOINT_DIR = "checkpoints"
 
 NUM_CLASSES = 5  # 4 cells + 1 background
 FOCAL_ALPHA = 0.25  # Optimized balancing factor
-FOCAL_GAMMA = 2.0  # Focusing parameter
+FOCAL_GAMMA = 1.5  # Focusing parameter
 # Class weights to handle imbalance (BG, Class 1, 2, 3, 4)
-CLASS_WEIGHTS = [1.0, 0.8, 0.8, 2.5, 2.5]
+CLASS_WEIGHTS = [1.0, 1.0, 2.5, 2.5, 3.0]
 
-BATCH_SIZE = 12
+BATCH_SIZE = 8
 NUM_WORKERS = 2
 
-NUM_EPOCHS = 100
+NUM_EPOCHS = 45
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 LR_STEP_SIZE = 25
@@ -224,10 +224,10 @@ def get_transform(train: bool) -> A.Compose:
                 A.OneOf(
                     [
                         A.ElasticTransform(alpha=1, sigma=50, p=0.5),
-                        A.GridDistortion(num_steps=5, distort_limit=0.1, p=0.5),
+                        A.GridDistortion(num_steps=5, distort_limit=0.05, p=0.5),
                         A.OpticalDistortion(distort_limit=0.05, p=0.5),
                     ],
-                    p=0.3,
+                    p=0.15,
                 ),
                 # 3. Global Geometric (Affine)
                 # Conservative affine: slight shifting and scaling are fine.
@@ -378,8 +378,16 @@ def train_and_evaluate(rank: int, world_size: int, args: argparse.Namespace) -> 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=LEARNING_RATE * world_size, weight_decay=WEIGHT_DECAY
     )
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=LR_STEP_SIZE, gamma=LR_GAMMA
+
+    warmup_epochs = 5
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, total_iters=warmup_epochs
+    )
+    main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=NUM_EPOCHS - warmup_epochs, eta_min=1e-6
+    )
+    lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs]
     )
 
     scaler = torch.amp.GradScaler("cuda")
