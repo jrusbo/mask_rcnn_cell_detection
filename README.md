@@ -34,7 +34,7 @@ checkpoints/          # Saved training runs
 
 The project is configured in `pyproject.toml` and uses CUDA 13.0 wheels for `torch`, `torchvision`, and `torchaudio`.
 
-## Installation
+## Environment setup
 
 1) Create a virtual environment and sync the main dependencies:
 
@@ -98,6 +98,16 @@ This generates:
 - `datasets/coco_format/val.json`
 - tiled images under `datasets/coco_format/images/train` and `datasets/coco_format/images/val`
 
+## Sanity-check the generated dataset
+
+If you want to inspect the generated COCO annotations visually, run:
+
+```powershell
+uv run src/test_dataset.py
+```
+
+This saves preview PNGs into `datasets/coco_format/` and opens a window when OpenCV GUI support is available.
+
 ## Train the model
 
 Training uses Albumentations for augmentation, COCO annotations for the dataset, and Weights & Biases for logging.
@@ -146,27 +156,8 @@ uv run src/predict.py --model checkpoints\20260507_144335\best_model.pth
 
 This writes `test-results.json` in the repository root.
 
-## Sanity-check the generated dataset
-
-If you want to inspect the generated COCO annotations visually, run:
-
-```powershell
-uv run src/test_dataset.py
-```
-
-This saves preview PNGs into `datasets/coco_format/` and opens a window when OpenCV GUI support is available.
-
-## Important configuration knobs
-
-- `src/preprocessing.py`
-  - `RAW_DATA_DIR`: location of the raw training folders
-  - `PATCH_SIZE`, `OVERLAP`: tiling settings
-  - `NUM_CLASSES`: number of foreground cell categories
-- `src/train.py`
-  - `BATCH_SIZE`, `NUM_EPOCHS`, `LEARNING_RATE`: training hyperparameters
-  - `MIN_SIZE`, `MAX_SIZE`: image resizing limits used by the detector
-- `src/predict.py`
-  - `SCORE_THRESHOLD`, `MASK_THRESHOLD`: inference filtering thresholds
+## Important Information
+Parameters are coded as global constants in the respective scripts for simplicity. Before running any script, review and update these constants as needed to point to the correct paths, set hyperparameters, or adjust other settings.
 
 ## Expected outputs
 
@@ -175,4 +166,10 @@ This saves preview PNGs into `datasets/coco_format/` and opens a window when Ope
 - `checkpoints/<run_name>/*.pth`: saved checkpoints
 - `test-results.json`: inference output in submission format
 
+## Performance Snapshot
 
+![leaderboard_ranking.png](assets/leaderboard_ranking.png)
+![learning_rate.png](assets/learning_rate.png)
+![train_loss.png](assets/train_loss.png)
+![val_ap_50.png](assets/val_ap_50.png)
+![ap_50_score.png](assets/ap_50_score.png)
