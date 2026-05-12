@@ -1,39 +1,64 @@
-import os
-import json
-import torch
+"""Run inference on the test set and write a COCO-style submission file."""
+
 import argparse
+import json
+import os
 import warnings
+
 import numpy as np
 import skimage.io as sio
+import torch
 from pycocotools import mask as mask_utils
 from tqdm.auto import tqdm
 
 from model import build_dcnv2_mask_rcnn
 
-# =========================================================
-# GLOBAL INFERENCE CONFIGURATION
-# =========================================================
+
 TEST_DIR = "datasets/test_release"
 MAP_FILE = os.path.join("datasets", "test_image_name_to_ids.json")
 OUTPUT_FILE = "test-results.json"
 
-SCORE_THRESHOLD = 0.05 # Bounding Box Confidence
-MASK_THRESHOLD = 0.5 # Pixel Probability Threshold
+SCORE_THRESHOLD = 0.05  # Bounding Box Confidence
+MASK_THRESHOLD = 0.5  # Pixel Probability Threshold
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Run Instance Segmentation Inference")
+def parse_args() -> argparse.Namespace:
+    """Parse the CLI arguments for inference.
+
+    Returns:
+        Namespace object containing:
+        - model (str): Path to the trained checkpoint file to load.
+    """
+
+    parser = argparse.ArgumentParser(description="Run instance segmentation inference")
     parser.add_argument(
         "--model",
         type=str,
         required=True,
-        help="Path to the trained .pth checkpoint (e.g., checkpoints/2026.../best_ap50_model.pth)"
+        help="Path to the trained .pth checkpoint (e.g., checkpoints/2026.../best_ap50_model.pth)",
     )
     return parser.parse_args()
 
 
-def generate_submission(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def generate_submission(args: argparse.Namespace) -> None:
+    """Load a trained checkpoint, run inference, and save a submission JSON file.
+
+    Orchestrates the complete inference pipeline:
+    1. Loads the model and checkpoint from the specified path
+    2. Iterates over test images from TEST_DIR
+    3. Runs model inference with optional NMS filtering
+    4. Encodes predicted masks in COCO RLE format
+    5. Writes all predictions to OUTPUT_FILE in submission format
+
+    Args:
+        args: Parsed command-line arguments containing:
+            - model (str): Path to the trained checkpoint file.
+
+    Raises:
+        FileNotFoundError: If the checkpoint file does not exist.
+    """
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Loading model from {args.model} on {device}...")
 
     model = build_dcnv2_mask_rcnn()
@@ -43,25 +68,24 @@ def generate_submission(args):
 
     checkpoint = torch.load(args.model, map_location=device, weights_only=False)
 
-    if 'model_state_dict' in checkpoint:
-        model_state = checkpoint['model_state_dict']
+    if "model_state_dict" in checkpoint:
+        model_state = checkpoint["model_state_dict"]
     else:
         model_state = checkpoint
 
-    # Handle DDP saved state dict if necessary
     new_state_dict = {}
     for k, v in model_state.items():
-        if k.startswith('module.'):
+        if k.startswith("module."):
             new_state_dict[k[7:]] = v
         else:
             new_state_dict[k] = v
-    
+
     model.load_state_dict(new_state_dict)
 
     model.to(device)
     model.eval()
 
-    with open(MAP_FILE, 'r') as f:
+    with open(MAP_FILE, "r", encoding="utf-8") as f:
         image_mappings = json.load(f)
 
     submission_data = []
@@ -83,8 +107,7 @@ def generate_submission(args):
 
             if len(img.shape) == 3 and img.shape[2] == 4:
                 img = img[:, :, :3]
-            
-            # Handle grayscale
+
             if len(img.shape) == 2:
                 img = np.stack([img, img, img], axis=2)
 
@@ -97,10 +120,10 @@ def generate_submission(args):
 
             outputs = model([img_tensor])[0]
 
-            boxes = outputs['boxes'].cpu().numpy()
-            scores = outputs['scores'].cpu().numpy()
-            labels = outputs['labels'].cpu().numpy()
-            masks = outputs['masks'].squeeze(1).cpu().numpy()
+            boxes = outputs["boxes"].cpu().numpy()
+            scores = outputs["scores"].cpu().numpy()
+            labels = outputs["labels"].cpu().numpy()
+            masks = outputs["masks"].squeeze(1).cpu().numpy()
 
             for i in range(len(scores)):
                 score = float(scores[i])
@@ -113,23 +136,34 @@ def generate_submission(args):
 
                 binary_mask = (masks[i] > MASK_THRESHOLD).astype(np.uint8)
                 rle = mask_utils.encode(np.asfortranarray(binary_mask))
-                rle['counts'] = rle['counts'].decode('utf-8')
+                rle["counts"] = rle["counts"].decode("utf-8")
 
-                submission_data.append({
-                    "image_id": int(img_id),
-                    "category_id": int(labels[i]),
-                    "bbox": bbox,
-                    "score": score,
-                    "segmentation": rle
-                })
+                submission_data.append(
+                    {
+                        "image_id": int(img_id),
+                        "category_id": int(labels[i]),
+                        "bbox": bbox,
+                        "score": score,
+                        "segmentation": rle,
+                    }
+                )
 
     print(f"\nSaving {len(submission_data)} predictions to {OUTPUT_FILE}...")
-    with open(OUTPUT_FILE, 'w') as f:
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(submission_data, f, indent=4)
 
     print("Inference Complete! Output strictly matches evaluation format.")
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Command-line entry point for inference.
+
+    Parses CLI arguments and triggers the submission generation pipeline.
+    """
+
     args = parse_args()
     generate_submission(args)
+
+
+if __name__ == "__main__":
+    main()

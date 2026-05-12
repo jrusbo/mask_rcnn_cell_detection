@@ -209,3 +209,5 @@ __marimo__/
 /checkpoints/
 /pre_trained_models/
 /wandb/
+*.zip
+*.json

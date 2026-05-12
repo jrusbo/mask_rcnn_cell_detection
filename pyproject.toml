@@ -27,3 +27,8 @@ name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6.0",
+]
+
