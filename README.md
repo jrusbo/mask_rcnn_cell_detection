@@ -84,7 +84,7 @@ The preprocessing pipeline expects a raw folder structure containing per-sample 
 - `class3.tif`
 - `class4.tif`
 
-By default, `src/preprocessing.py` points `RAW_DATA_DIR` to a Kaggle path. Update that constant to your local training directory before running the script.
+By default, `src/preprocessing.py` points `RAW_DATA_DIR` to a path in my computer. Update that constant to your local training directory before running the script.
 
 Run preprocessing:
 
